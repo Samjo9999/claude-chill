@@ -13,7 +13,13 @@ mod tests {
 
     fn pty_mock_binary() -> String {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        format!("{}/../../target/debug/pty-mock", manifest_dir)
+        let bin = format!("{}/../../target/debug/pty-mock", manifest_dir);
+        assert!(
+            std::path::Path::new(&bin).exists(),
+            "pty-mock not found at {} — run: cargo build -p pty-mock",
+            bin
+        );
+        bin
     }
 
     fn spawn_command(cmd: &str, args: &[&str]) -> (OwnedFd, Child) {
@@ -390,6 +396,59 @@ mod tests {
             !screen_after_exit.contains("Claude Code v2.1.84"),
             "header should NOT survive clear + alt screen round-trip, got: {:?}",
             screen_after_exit
+        );
+    }
+
+    #[test]
+    fn test_sync_block_tracking() {
+        let (master, child) = spawn_mock("echo");
+        let mut proxy = make_proxy(master, child);
+        let sink = dev_null();
+
+        // Start a sync block without ending it
+        proxy
+            .process_output(b"\x1b[?2026h some content", &sink)
+            .expect("partial sync block");
+        assert!(
+            proxy.is_in_sync_block(),
+            "should be in sync block after SYNC_START without SYNC_END"
+        );
+
+        // End the sync block
+        proxy
+            .process_output(b" more content \x1b[?2026l", &sink)
+            .expect("sync block end");
+        assert!(
+            !proxy.is_in_sync_block(),
+            "should not be in sync block after SYNC_END"
+        );
+    }
+
+    #[test]
+    fn test_lookback_mode_toggle() {
+        let (master, child) = spawn_mock("echo");
+        let mut proxy = make_proxy(master, child);
+        let sink = dev_null();
+
+        // Generate some output so lookback has content
+        proxy
+            .process_output(b"line 1\r\nline 2\r\nline 3\r\n", &sink)
+            .expect("output");
+
+        assert!(!proxy.is_in_lookback_mode());
+
+        // Send legacy lookback key (0x1E = Ctrl+^)
+        send_input(&mut proxy, &sink, &[0x1E]);
+        assert!(
+            proxy.is_in_lookback_mode(),
+            "should enter lookback mode after Ctrl+^"
+        );
+
+        // Send it again to exit
+        send_input(&mut proxy, &sink, &[0x1E]);
+        assert!(
+            !proxy.is_in_lookback_mode(),
+            "should exit lookback mode after second Ctrl+^"
         );
     }
 
