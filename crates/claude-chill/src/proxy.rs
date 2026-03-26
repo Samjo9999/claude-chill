@@ -1,8 +1,8 @@
 use crate::escape_sequences::{
     ALT_SCREEN_ENTER, ALT_SCREEN_ENTER_LEGACY, ALT_SCREEN_EXIT, ALT_SCREEN_EXIT_LEGACY,
     BRACKETED_PASTE_DISABLE, BRACKETED_PASTE_ENABLE, BRACKETED_PASTE_END, BRACKETED_PASTE_START,
-    CLEAR_SCREEN, CURSOR_HOME, INPUT_BUFFER_CAPACITY, OUTPUT_BUFFER_CAPACITY,
-    SYNC_BUFFER_CAPACITY, SYNC_END, SYNC_START,
+    CLEAR_SCREEN, CURSOR_HOME, INPUT_BUFFER_CAPACITY, OUTPUT_BUFFER_CAPACITY, SYNC_BUFFER_CAPACITY,
+    SYNC_END, SYNC_START,
 };
 use crate::history_filter::HistoryFilter;
 use crate::line_buffer::LineBuffer;
@@ -131,6 +131,8 @@ pub struct Proxy {
     alt_screen_exit_legacy_finder: memmem::Finder<'static>,
     paste_start_finder: memmem::Finder<'static>,
     paste_end_finder: memmem::Finder<'static>,
+    pty_drain_buffer: Vec<u8>,
+    paste_remainder: Vec<u8>,
 }
 
 /// Returns (supported, initial_flags) - if flags > 0, terminal is already in Kitty mode
@@ -315,6 +317,8 @@ impl Proxy {
             alt_screen_exit_legacy_finder: memmem::Finder::new(ALT_SCREEN_EXIT_LEGACY),
             paste_start_finder: memmem::Finder::new(BRACKETED_PASTE_START),
             paste_end_finder: memmem::Finder::new(BRACKETED_PASTE_END),
+            pty_drain_buffer: Vec::new(),
+            paste_remainder: Vec::new(),
         })
     }
 
@@ -381,7 +385,13 @@ impl Proxy {
             {
                 match nix_read(&stdin_fd, &mut buf) {
                     Ok(0) => break,
-                    Ok(n) => self.process_input(&buf[..n], &stdout_fd)?,
+                    Ok(n) => {
+                        self.process_input(&buf[..n], &stdout_fd)?;
+                        if !self.pty_drain_buffer.is_empty() {
+                            let drained = std::mem::take(&mut self.pty_drain_buffer);
+                            self.process_output(&drained, &stdout_fd)?;
+                        }
+                    }
                     Err(Errno::EAGAIN) => {}
                     Err(e) => anyhow::bail!("read from stdin failed: {}", e),
                 }
@@ -835,26 +845,49 @@ impl Proxy {
     fn process_input<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
         self.last_stdin_time = Some(Instant::now());
 
-        debug!("process_input: stdin={:?} paste={}", data, self.in_bracketed_paste);
+        debug!(
+            "process_input: stdin={:?} paste={}",
+            data, self.in_bracketed_paste
+        );
 
         // In alternate screen, forward directly with deadlock prevention
         if self.in_alternate_screen {
-            return write_to_pty_draining(&self.pty_master, data, stdout_fd);
+            return write_to_pty_draining(&self.pty_master, data, &mut self.pty_drain_buffer);
         }
 
         // In bracketed paste, forward directly until paste end marker
         if self.in_bracketed_paste {
-            if let Some(pos) = self.paste_end_finder.find(data) {
+            let combined;
+            let search_data = if self.paste_remainder.is_empty() {
+                data
+            } else {
+                combined = [self.paste_remainder.as_slice(), data].concat();
+                self.paste_remainder.clear();
+                &combined
+            };
+
+            if let Some(pos) = self.paste_end_finder.find(search_data) {
                 let end = pos + BRACKETED_PASTE_END.len();
-                write_to_pty_draining(&self.pty_master, &data[..end], stdout_fd)?;
+                write_to_pty_draining(
+                    &self.pty_master,
+                    &search_data[..end],
+                    &mut self.pty_drain_buffer,
+                )?;
                 self.in_bracketed_paste = false;
                 debug!("process_input: bracketed paste ended");
-                if end < data.len() {
-                    return self.process_input(&data[end..], stdout_fd);
+                if end < search_data.len() {
+                    return self.process_input(&search_data[end..], stdout_fd);
                 }
                 return Ok(());
             }
-            return write_to_pty_draining(&self.pty_master, data, stdout_fd);
+
+            let (forward, remainder) =
+                split_trailing_marker_prefix(search_data, BRACKETED_PASTE_END);
+            if !forward.is_empty() {
+                write_to_pty_draining(&self.pty_master, forward, &mut self.pty_drain_buffer)?;
+            }
+            self.paste_remainder.extend_from_slice(remainder);
+            return Ok(());
         }
 
         // Check for bracketed paste start
@@ -868,19 +901,29 @@ impl Proxy {
             let paste_data = &data[pos..];
             // Check if paste end is in same chunk
             let search_start = BRACKETED_PASTE_START.len();
-            if paste_data.len() > search_start {
-                if let Some(end_pos) = self.paste_end_finder.find(&paste_data[search_start..]) {
-                    let end = search_start + end_pos + BRACKETED_PASTE_END.len();
-                    write_to_pty_draining(&self.pty_master, &paste_data[..end], stdout_fd)?;
-                    self.in_bracketed_paste = false;
-                    debug!("process_input: bracketed paste ended (same chunk)");
-                    if end < paste_data.len() {
-                        return self.process_input(&paste_data[end..], stdout_fd);
-                    }
-                    return Ok(());
+            if paste_data.len() > search_start
+                && let Some(end_pos) = self.paste_end_finder.find(&paste_data[search_start..])
+            {
+                let end = search_start + end_pos + BRACKETED_PASTE_END.len();
+                write_to_pty_draining(
+                    &self.pty_master,
+                    &paste_data[..end],
+                    &mut self.pty_drain_buffer,
+                )?;
+                self.in_bracketed_paste = false;
+                debug!("process_input: bracketed paste ended (same chunk)");
+                if end < paste_data.len() {
+                    return self.process_input(&paste_data[end..], stdout_fd);
                 }
+                return Ok(());
             }
-            return write_to_pty_draining(&self.pty_master, paste_data, stdout_fd);
+            let (forward, remainder) =
+                split_trailing_marker_prefix(paste_data, BRACKETED_PASTE_END);
+            if !forward.is_empty() {
+                write_to_pty_draining(&self.pty_master, forward, &mut self.pty_drain_buffer)?;
+            }
+            self.paste_remainder.extend_from_slice(remainder);
+            return Ok(());
         }
 
         self.process_input_lookback(data, stdout_fd)
@@ -1153,19 +1196,18 @@ fn write_all<F: AsFd>(fd: &F, data: &[u8]) -> Result<()> {
 /// pty buffer is full. This prevents the classic pty deadlock where both
 /// sides block on full buffers (stdin→pty blocks because pty buffer is full,
 /// child→pty blocks because its output buffer is also full).
-fn write_to_pty_draining<P: AsFd, S: AsFd>(pty: &P, data: &[u8], stdout_fd: &S) -> Result<()> {
+fn write_to_pty_draining<P: AsFd>(pty: &P, data: &[u8], drain_buffer: &mut Vec<u8>) -> Result<()> {
     let mut written = 0;
-    let mut drain_buf = [0u8; 65536];
+    let mut read_buf = [0u8; 65536];
 
     while written < data.len() {
         match write(pty, &data[written..]) {
             Ok(n) => written += n,
             Err(Errno::EAGAIN) => {
                 // PTY buffer full — drain child output to make room
-                match nix_read(pty, &mut drain_buf) {
+                match nix_read(pty, &mut read_buf) {
                     Ok(n) if n > 0 => {
-                        // Pass child output straight to the terminal
-                        write_all(stdout_fd, &drain_buf[..n])?;
+                        drain_buffer.extend_from_slice(&read_buf[..n]);
                     }
                     _ => {
                         // Nothing available yet, poll briefly
@@ -1186,6 +1228,17 @@ fn write_to_pty_draining<P: AsFd, S: AsFd>(pty: &P, data: &[u8], stdout_fd: &S) 
 
 fn nix_read<F: AsFd>(fd: &F, buf: &mut [u8]) -> Result<usize, Errno> {
     read(fd.as_fd(), buf)
+}
+
+fn split_trailing_marker_prefix<'a>(data: &'a [u8], marker: &[u8]) -> (&'a [u8], &'a [u8]) {
+    let max_prefix = marker.len().saturating_sub(1).min(data.len());
+    for prefix_len in (1..=max_prefix).rev() {
+        if data.ends_with(&marker[..prefix_len]) {
+            let split = data.len() - prefix_len;
+            return (&data[..split], &data[split..]);
+        }
+    }
+    (data, &[])
 }
 
 #[cfg(test)]
@@ -1446,5 +1499,77 @@ mod tests {
             check_sequence(b"ab", 0x1E, sequence),
             SequenceMatch::Complete
         );
+    }
+
+    #[test]
+    fn test_split_trailing_marker_prefix_no_match() {
+        let marker = b"\x1b[201~";
+        let data = b"hello world";
+        let (forward, remainder) = split_trailing_marker_prefix(data, marker);
+        assert_eq!(forward, b"hello world");
+        assert!(remainder.is_empty());
+    }
+
+    #[test]
+    fn test_split_trailing_marker_prefix_one_byte() {
+        let marker = b"\x1b[201~";
+        let data = b"paste data\x1b";
+        let (forward, remainder) = split_trailing_marker_prefix(data, marker);
+        assert_eq!(forward, b"paste data");
+        assert_eq!(remainder, b"\x1b");
+    }
+
+    #[test]
+    fn test_split_trailing_marker_prefix_partial() {
+        let marker = b"\x1b[201~";
+        let data = b"paste data\x1b[20";
+        let (forward, remainder) = split_trailing_marker_prefix(data, marker);
+        assert_eq!(forward, b"paste data");
+        assert_eq!(remainder, b"\x1b[20");
+    }
+
+    #[test]
+    fn test_split_trailing_marker_prefix_max_prefix() {
+        let marker = b"\x1b[201~";
+        let data = b"paste\x1b[201";
+        let (forward, remainder) = split_trailing_marker_prefix(data, marker);
+        assert_eq!(forward, b"paste");
+        assert_eq!(remainder, b"\x1b[201");
+    }
+
+    #[test]
+    fn test_split_trailing_marker_prefix_full_marker_not_held() {
+        let marker = b"\x1b[201~";
+        let data = b"paste\x1b[201~";
+        let (forward, remainder) = split_trailing_marker_prefix(data, marker);
+        assert_eq!(forward, b"paste\x1b[201~");
+        assert!(remainder.is_empty());
+    }
+
+    #[test]
+    fn test_split_trailing_marker_prefix_false_positive() {
+        let marker = b"\x1b[201~";
+        let data = b"paste data\x1b[999";
+        let (forward, remainder) = split_trailing_marker_prefix(data, marker);
+        assert_eq!(forward, b"paste data\x1b[999");
+        assert!(remainder.is_empty());
+    }
+
+    #[test]
+    fn test_split_trailing_marker_prefix_empty_data() {
+        let marker = b"\x1b[201~";
+        let data = b"";
+        let (forward, remainder) = split_trailing_marker_prefix(data, marker);
+        assert!(forward.is_empty());
+        assert!(remainder.is_empty());
+    }
+
+    #[test]
+    fn test_split_trailing_marker_prefix_data_shorter_than_marker() {
+        let marker = b"\x1b[201~";
+        let data = b"\x1b[2";
+        let (forward, remainder) = split_trailing_marker_prefix(data, marker);
+        assert!(forward.is_empty());
+        assert_eq!(remainder, b"\x1b[2");
     }
 }
