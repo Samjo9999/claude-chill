@@ -524,12 +524,10 @@ impl Proxy {
         );
 
         if self.in_alternate_screen {
-            // Feed VT but NOT history while in alt screen
-            // Alt screen content (TUI editors, etc.) shouldn't be in lookback history
-            if feed_vt {
-                self.vt_parser.process(data);
-            }
-            return self.process_output_alt_screen(data, stdout_fd);
+            // Don't feed VT upfront - process_output_alt_screen feeds incrementally
+            // so we can render the clean restored main buffer at alt exit before
+            // any post-exit data (like clear screen + redraw) modifies it
+            return self.process_output_alt_screen(data, stdout_fd, feed_vt);
         }
 
         if self.in_lookback_mode {
@@ -539,8 +537,16 @@ impl Proxy {
         }
 
         // Feed data to VT emulator (unless already fed by caller)
+        // If there's an alt screen enter, only feed up to it - the alt screen
+        // handler feeds the rest incrementally to avoid processing past
+        // a potential alt exit before rendering
         if feed_vt {
-            self.vt_parser.process(data);
+            if let Some(enter_pos) = self.find_alt_screen_enter(data) {
+                let seq_len = self.alt_screen_enter_len(&data[enter_pos..]);
+                self.vt_parser.process(&data[..enter_pos + seq_len]);
+            } else {
+                self.vt_parser.process(data);
+            }
         }
         self.vt_render_pending = true;
         self.last_output_time = Some(Instant::now());
@@ -568,7 +574,13 @@ impl Proxy {
                 let seq_len = self.alt_screen_enter_len(&data[pos + alt_pos..]);
                 // Write alt screen enter directly
                 self.write_to_terminal(stdout_fd, &data[pos + alt_pos..pos + alt_pos + seq_len])?;
-                return self.process_output_alt_screen(&data[pos + alt_pos + seq_len..], stdout_fd);
+                // VT was only fed up to the alt enter; the alt screen handler
+                // will feed the rest incrementally
+                return self.process_output_alt_screen(
+                    &data[pos + alt_pos + seq_len..],
+                    stdout_fd,
+                    true,
+                );
             }
 
             if self.in_sync_block {
@@ -603,15 +615,29 @@ impl Proxy {
         Ok(())
     }
 
-    fn process_output_alt_screen<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
+    fn process_output_alt_screen<F: AsFd>(
+        &mut self,
+        data: &[u8],
+        stdout_fd: &F,
+        feed_vt: bool,
+    ) -> Result<()> {
         if let Some(exit_pos) = self.find_alt_screen_exit(data) {
             debug!(
                 "process_output_alt_screen: ALT_SCREEN_EXIT detected at pos={}",
                 exit_pos
             );
-            self.write_to_terminal(stdout_fd, &data[..exit_pos])?;
             let seq_len = self.alt_screen_exit_len(&data[exit_pos..]);
-            self.write_to_terminal(stdout_fd, &data[exit_pos..exit_pos + seq_len])?;
+            let alt_end = exit_pos + seq_len;
+
+            // Feed VT parser ONLY up to and including the alt exit sequence.
+            // This restores the main screen buffer cleanly without any post-exit
+            // data (like clear screen + redraw) clobbering the restored content.
+            if feed_vt {
+                self.vt_parser.process(&data[..alt_end]);
+            }
+
+            self.write_to_terminal(stdout_fd, &data[..exit_pos])?;
+            self.write_to_terminal(stdout_fd, &data[exit_pos..alt_end])?;
             self.in_alternate_screen = false;
 
             // Force full VT render to restore main screen content
@@ -619,34 +645,20 @@ impl Proxy {
             self.vt_prev_screen = None;
             self.render_vt_screen(stdout_fd)?;
 
-            // Data after ALT_EXIT was already fed to VT and history when we processed
-            // the alt screen chunk, so we just need to check for more alt screen transitions
-            let remaining = &data[exit_pos + seq_len..];
+            // Process remaining data through the normal pipeline so it gets
+            // proper VT feeding, history tracking, and sync block handling
+            let remaining = &data[alt_end..];
             if !remaining.is_empty() {
-                // Check if there's another alt screen enter in the remaining data
-                if self.find_alt_screen_enter(remaining).is_some() {
-                    // Need to process for alt screen detection, but skip VT/history feed
-                    return self.process_output_check_alt_only(remaining, stdout_fd);
-                }
+                return self.process_output_inner(remaining, stdout_fd, feed_vt);
             }
             return Ok(());
         }
-        self.write_to_terminal(stdout_fd, data)
-    }
 
-    /// Check for alt screen transitions without re-feeding VT/history
-    fn process_output_check_alt_only<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
-        if let Some(alt_pos) = self.find_alt_screen_enter(data) {
-            debug!(
-                "process_output_check_alt_only: ALT_SCREEN_ENTER at pos={}",
-                alt_pos
-            );
-            self.in_alternate_screen = true;
-            let seq_len = self.alt_screen_enter_len(&data[alt_pos..]);
-            self.write_to_terminal(stdout_fd, &data[alt_pos..alt_pos + seq_len])?;
-            return self.process_output_alt_screen(&data[alt_pos + seq_len..], stdout_fd);
+        // No exit found - feed VT and write through to terminal
+        if feed_vt {
+            self.vt_parser.process(data);
         }
-        Ok(())
+        self.write_to_terminal(stdout_fd, data)
     }
 
     fn find_alt_screen_enter(&self, data: &[u8]) -> Option<usize> {
