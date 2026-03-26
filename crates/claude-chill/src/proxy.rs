@@ -322,6 +322,105 @@ impl Proxy {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        pty_master: OwnedFd,
+        child: Child,
+        config: ProxyConfig,
+        rows: u16,
+        cols: u16,
+    ) -> Self {
+        let vt_parser = vt100::Parser::new(rows, cols, 0);
+        let mut history = LineBuffer::new(config.max_history_lines);
+        history.push_bytes(CLEAR_SCREEN);
+        history.push_bytes(CURSOR_HOME);
+        let auto_lookback_timeout = Duration::from_millis(config.auto_lookback_timeout_ms);
+
+        Self {
+            history,
+            history_filter: HistoryFilter::new(),
+            config,
+            pty_master,
+            child,
+            original_termios: None,
+            vt_parser,
+            vt_prev_screen: None,
+            last_output_time: None,
+            last_render_time: None,
+            last_stdin_time: None,
+            last_auto_lookback_time: None,
+            auto_lookback_timeout,
+            sync_buffer: Vec::with_capacity(SYNC_BUFFER_CAPACITY),
+            in_sync_block: false,
+            in_lookback_mode: false,
+            in_alternate_screen: false,
+            in_bracketed_paste: false,
+            kitty_mode_supported: false,
+            kitty_mode_stack: 0,
+            kitty_output_parser: TermwizParser::new(),
+            vt_render_pending: false,
+            lookback_cache: Vec::new(),
+            lookback_input_buffer: Vec::with_capacity(INPUT_BUFFER_CAPACITY),
+            output_buffer: Vec::with_capacity(OUTPUT_BUFFER_CAPACITY),
+            sync_start_finder: memmem::Finder::new(SYNC_START),
+            sync_end_finder: memmem::Finder::new(SYNC_END),
+            clear_screen_finder: memmem::Finder::new(CLEAR_SCREEN),
+            cursor_home_finder: memmem::Finder::new(CURSOR_HOME),
+            alt_screen_enter_finder: memmem::Finder::new(ALT_SCREEN_ENTER),
+            alt_screen_exit_finder: memmem::Finder::new(ALT_SCREEN_EXIT),
+            alt_screen_enter_legacy_finder: memmem::Finder::new(ALT_SCREEN_ENTER_LEGACY),
+            alt_screen_exit_legacy_finder: memmem::Finder::new(ALT_SCREEN_EXIT_LEGACY),
+            paste_start_finder: memmem::Finder::new(BRACKETED_PASTE_START),
+            paste_end_finder: memmem::Finder::new(BRACKETED_PASTE_END),
+            pty_drain_buffer: Vec::new(),
+            paste_remainder: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn history(&self) -> &LineBuffer {
+        &self.history
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_in_alternate_screen(&self) -> bool {
+        self.in_alternate_screen
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_in_bracketed_paste(&self) -> bool {
+        self.in_bracketed_paste
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_in_sync_block(&self) -> bool {
+        self.in_sync_block
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_in_lookback_mode(&self) -> bool {
+        self.in_lookback_mode
+    }
+
+    #[cfg(test)]
+    pub(crate) fn vt_screen_text(&self) -> String {
+        self.vt_parser.screen().contents()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pty_master_fd_raw(&self) -> i32 {
+        self.pty_master.as_raw_fd()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flush_drain_buffer<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+        if !self.pty_drain_buffer.is_empty() {
+            let drained = std::mem::take(&mut self.pty_drain_buffer);
+            self.process_output(&drained, stdout_fd)?;
+        }
+        Ok(())
+    }
+
     pub fn run(&mut self) -> Result<i32> {
         let stdin_fd = io::stdin();
         let stdout_fd = io::stdout();
@@ -406,7 +505,7 @@ impl Proxy {
         self.wait_child()
     }
 
-    fn process_output<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
+    pub(crate) fn process_output<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
         self.process_output_inner(data, stdout_fd, true)
     }
 
@@ -842,7 +941,7 @@ impl Proxy {
         Ok(())
     }
 
-    fn process_input<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
+    pub(crate) fn process_input<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
         self.last_stdin_time = Some(Instant::now());
 
         debug!(
