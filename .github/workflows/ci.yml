@@ -1,0 +1,193 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - master
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version-badge:
+    name: Version Badge
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check version badge matches Cargo.toml
+        run: |
+          CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          BADGE_VERSION=$(grep -oP 'badge/version-\K[0-9]+\.[0-9]+\.[0-9]+' README.md | head -1)
+          if [ "$CARGO_VERSION" != "$BADGE_VERSION" ]; then
+            echo "Version mismatch: Cargo.toml=$CARGO_VERSION README badge=$BADGE_VERSION"
+            exit 1
+          fi
+          echo "Version badge matches: $CARGO_VERSION"
+
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --all-targets
+
+  check-windows:
+    name: Check (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --all-targets
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  clippy-windows:
+    name: Clippy (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test-matrix:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --all-targets
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: test-matrix
+    if: always()
+    steps:
+      - run: |
+          if [[ "${{ needs.test-matrix.result }}" != "success" ]]; then
+            exit 1
+          fi
+
+  integration:
+    name: Integration Tests
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install expect (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y expect
+      - name: Install expect (macOS)
+        if: runner.os == 'macOS'
+        run: command -v expect || brew install expect
+      - run: cargo build
+      - run: expect tests/integration.exp
+
+  nix-build:
+    name: Nix Build
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - run: nix build .# -L
+
+  # --- Build release binaries ---
+
+  build-windows:
+    name: Build Windows EXE
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: claude-chill-windows-x86_64
+          path: target/release/claude-chill.exe
+
+  build-linux:
+    name: Build Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: claude-chill-linux-x86_64
+          path: target/release/claude-chill
+
+  build-macos:
+    name: Build macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: claude-chill-macos-x86_64
+          path: target/release/claude-chill
+
+  # --- Release on tag push ---
+
+  release:
+    name: Release
+    needs: [build-windows, build-linux, build-macos, test, check-windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          cd artifacts
+          cd claude-chill-windows-x86_64 && zip ../claude-chill-windows-x86_64.zip claude-chill.exe && cd ..
+          cd claude-chill-linux-x86_64 && chmod +x claude-chill && tar czf ../claude-chill-linux-x86_64.tar.gz claude-chill && cd ..
+          cd claude-chill-macos-x86_64 && chmod +x claude-chill && tar czf ../claude-chill-macos-x86_64.tar.gz claude-chill && cd ..
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/claude-chill-windows-x86_64.zip
+            artifacts/claude-chill-linux-x86_64.tar.gz
+            artifacts/claude-chill-macos-x86_64.tar.gz
+          generate_release_notes: true

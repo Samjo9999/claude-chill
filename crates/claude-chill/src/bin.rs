@@ -1,0 +1,83 @@
+mod cli;
+
+use clap::Parser;
+use claude_chill::config::Config;
+use claude_chill::key_parser;
+use claude_chill::proxy::{Proxy, ProxyConfig};
+use log::debug;
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    // Only enable logging if CLAUDE_CHILL_LOG_FILE is set
+    if let Ok(log_file) = std::env::var("CLAUDE_CHILL_LOG_FILE") {
+        use std::fs::OpenOptions;
+        if let Ok(file) = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&log_file)
+        {
+            env_logger::Builder::new()
+                .filter_level(log::LevelFilter::Debug)
+                .target(env_logger::Target::Pipe(Box::new(file)))
+                .init();
+        }
+    }
+
+    let cli = cli::Cli::parse();
+    let config = Config::load();
+
+    let history_lines = cli.history_lines.unwrap_or(config.history_lines);
+
+    let lookback_key = cli
+        .lookback_key
+        .clone()
+        .unwrap_or_else(|| config.lookback_key.clone());
+
+    let (lookback_sequence_legacy, lookback_sequence_kitty) = match key_parser::parse(&lookback_key)
+    {
+        Ok(key) => {
+            let legacy = key.to_escape_sequence();
+            let kitty = key.to_kitty_sequence().unwrap_or_else(|| legacy.clone());
+            (legacy, kitty)
+        }
+        Err(e) => {
+            eprintln!("Invalid lookback key '{}': {}", lookback_key, e);
+            eprintln!("Using default: [ctrl][6]");
+            (vec![0x1E], b"\x1b[54;5u".to_vec())
+        }
+    };
+
+    debug!(
+        "Lookback sequences: legacy={:?} kitty={:?}",
+        lookback_sequence_legacy, lookback_sequence_kitty
+    );
+
+    let auto_lookback_timeout_ms = cli
+        .auto_lookback_timeout
+        .unwrap_or(config.auto_lookback_timeout_ms);
+
+    let proxy_config = ProxyConfig {
+        max_history_lines: history_lines,
+        lookback_key,
+        lookback_sequence_legacy,
+        lookback_sequence_kitty,
+        auto_lookback_timeout_ms,
+    };
+
+    let cmd_args: Vec<&str> = cli.args.iter().map(|s| s.as_str()).collect();
+
+    match Proxy::spawn(&cli.command, &cmd_args, proxy_config) {
+        Ok(mut proxy) => match proxy.run() {
+            Ok(exit_code) => ExitCode::from(exit_code as u8),
+            Err(e) => {
+                eprintln!("Proxy error: {}", e);
+                ExitCode::from(1)
+            }
+        },
+        Err(e) => {
+            eprintln!("Failed to start proxy: {:#}", e);
+            ExitCode::from(1)
+        }
+    }
+}
