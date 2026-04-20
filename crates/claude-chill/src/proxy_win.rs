@@ -3,7 +3,7 @@
 //! This is the Windows equivalent of proxy.rs (Unix). It uses ConPTY
 //! for pseudo-terminal support and threads for I/O multiplexing.
 
-#![allow(non_snake_case, non_camel_case_types)]
+#![allow(non_snake_case, non_camel_case_types, clippy::upper_case_acronyms)]
 
 use crate::escape_sequences::{
     ALT_SCREEN_ENTER, ALT_SCREEN_ENTER_LEGACY, ALT_SCREEN_EXIT, ALT_SCREEN_EXIT_LEGACY,
@@ -359,8 +359,7 @@ fn resolve_command(command: &str) -> String {
     }
 
     let path_var = std::env::var("PATH").unwrap_or_default();
-    let pathext = std::env::var("PATHEXT")
-        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
     let extensions: Vec<&str> = pathext.split(';').collect();
 
     for dir in path_var.split(';') {
@@ -937,27 +936,26 @@ impl Proxy {
     ) {
         let actions = parser.parse_as_vec(data);
         for action in actions {
-            if let Action::CSI(csi) = action {
-                match csi {
-                    CSI::Keyboard(Keyboard::PushKittyState { flags, .. }) => {
-                        if supported {
-                            *stack = stack.saturating_add(1);
-                            debug!("Kitty push (flags={:?}, stack={})", flags, stack);
-                        }
-                    }
-                    CSI::Keyboard(Keyboard::SetKittyState { flags, .. }) => {
-                        if supported && !flags.is_empty() && *stack == 0 {
-                            *stack = 1;
-                            debug!("Kitty set (flags={:?}, stack={})", flags, stack);
-                        }
-                    }
-                    CSI::Keyboard(Keyboard::PopKittyState(n)) => {
-                        let prev = *stack;
-                        *stack = stack.saturating_sub(n);
-                        debug!("Kitty pop {} (stack {} -> {})", n, prev, stack);
-                    }
-                    _ => {}
+            let Action::CSI(csi) = action else {
+                continue;
+            };
+            match csi {
+                CSI::Keyboard(Keyboard::PushKittyState { flags, .. }) if supported => {
+                    *stack = stack.saturating_add(1);
+                    debug!("Kitty push (flags={:?}, stack={})", flags, stack);
                 }
+                CSI::Keyboard(Keyboard::SetKittyState { flags, .. })
+                    if supported && !flags.is_empty() && *stack == 0 =>
+                {
+                    *stack = 1;
+                    debug!("Kitty set (flags={:?}, stack={})", flags, stack);
+                }
+                CSI::Keyboard(Keyboard::PopKittyState(n)) => {
+                    let prev = *stack;
+                    *stack = stack.saturating_sub(n);
+                    debug!("Kitty pop {} (stack {} -> {})", n, prev, stack);
+                }
+                _ => {}
             }
         }
     }
@@ -1127,10 +1125,10 @@ impl Proxy {
         self.output_buffer.clear();
         self.history.append_all(&mut self.output_buffer);
 
-        if let Ok(path) = std::env::var("CLAUDE_CHILL_HISTORY_FILE") {
-            if let Err(e) = std::fs::write(&path, &self.output_buffer) {
-                debug!("Failed to write history file: {}", e);
-            }
+        if let Ok(path) = std::env::var("CLAUDE_CHILL_HISTORY_FILE")
+            && let Err(e) = std::fs::write(&path, &self.output_buffer)
+        {
+            debug!("Failed to write history file: {}", e);
         }
 
         self.write_to_terminal(CLEAR_SCREEN)?;
@@ -1203,17 +1201,17 @@ impl Proxy {
             self.in_bracketed_paste = true;
             let paste_data = &data[pos..];
             let search_start = BRACKETED_PASTE_START.len();
-            if paste_data.len() > search_start {
-                if let Some(end_pos) = self.paste_end_finder.find(&paste_data[search_start..]) {
-                    let end = search_start + end_pos + BRACKETED_PASTE_END.len();
-                    self.write_pty(&paste_data[..end])?;
-                    self.in_bracketed_paste = false;
-                    debug!("process_input: bracketed paste ended (same chunk)");
-                    if end < paste_data.len() {
-                        return self.process_input(&paste_data[end..]);
-                    }
-                    return Ok(());
+            if paste_data.len() > search_start
+                && let Some(end_pos) = self.paste_end_finder.find(&paste_data[search_start..])
+            {
+                let end = search_start + end_pos + BRACKETED_PASTE_END.len();
+                self.write_pty(&paste_data[..end])?;
+                self.in_bracketed_paste = false;
+                debug!("process_input: bracketed paste ended (same chunk)");
+                if end < paste_data.len() {
+                    return self.process_input(&paste_data[end..]);
                 }
+                return Ok(());
             }
             let (forward, remainder) =
                 split_trailing_marker_prefix(paste_data, BRACKETED_PASTE_END);
