@@ -611,38 +611,40 @@ impl Proxy {
     ) {
         let actions = parser.parse_as_vec(data);
         for action in actions {
-            if let Action::CSI(csi) = action {
-                match csi {
-                    CSI::Keyboard(Keyboard::PushKittyState { flags, .. }) => {
-                        if supported {
-                            *stack = stack.saturating_add(1);
-                            debug!(
-                                "Kitty keyboard protocol push (flags={:?}, stack={})",
-                                flags, stack
-                            );
-                        }
-                    }
-                    CSI::Keyboard(Keyboard::SetKittyState { flags, .. }) => {
-                        if supported && !flags.is_empty() && *stack == 0 {
-                            *stack = 1;
-                            debug!(
-                                "Kitty keyboard protocol set (flags={:?}, stack={})",
-                                flags, stack
-                            );
-                        } else if flags.is_empty() && *stack > 0 {
-                            debug!("Kitty keyboard protocol set empty flags (stack={})", stack);
-                        }
-                    }
-                    CSI::Keyboard(Keyboard::PopKittyState(n)) => {
-                        let prev = *stack;
-                        *stack = stack.saturating_sub(n);
-                        debug!(
-                            "Kitty keyboard protocol pop {} (stack {} -> {})",
-                            n, prev, stack
-                        );
-                    }
-                    _ => {}
+            let Action::CSI(csi) = action else {
+                continue;
+            };
+            match csi {
+                CSI::Keyboard(Keyboard::PushKittyState { flags, .. }) if supported => {
+                    *stack = stack.saturating_add(1);
+                    debug!(
+                        "Kitty keyboard protocol push (flags={:?}, stack={})",
+                        flags, stack
+                    );
                 }
+                CSI::Keyboard(Keyboard::SetKittyState { flags, .. })
+                    if supported && !flags.is_empty() && *stack == 0 =>
+                {
+                    *stack = 1;
+                    debug!(
+                        "Kitty keyboard protocol set (flags={:?}, stack={})",
+                        flags, stack
+                    );
+                }
+                CSI::Keyboard(Keyboard::SetKittyState { flags, .. })
+                    if flags.is_empty() && *stack > 0 =>
+                {
+                    debug!("Kitty keyboard protocol set empty flags (stack={})", stack);
+                }
+                CSI::Keyboard(Keyboard::PopKittyState(n)) => {
+                    let prev = *stack;
+                    *stack = stack.saturating_sub(n);
+                    debug!(
+                        "Kitty keyboard protocol pop {} (stack {} -> {})",
+                        n, prev, stack
+                    );
+                }
+                _ => {}
             }
         }
     }

@@ -13,7 +13,7 @@ use crate::escape_sequences::{
 };
 use crate::history_filter::HistoryFilter;
 use crate::line_buffer::LineBuffer;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use log::debug;
 use memchr::memmem;
 use std::ffi::c_void;
@@ -359,8 +359,8 @@ fn resolve_command(command: &str) -> String {
     }
 
     let path_var = std::env::var("PATH").unwrap_or_default();
-    let pathext =
-        std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    let pathext = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
     let extensions: Vec<&str> = pathext.split(';').collect();
 
     for dir in path_var.split(';') {
@@ -439,10 +439,7 @@ fn spawn_process(hpc: HPCON, command_line: &str) -> Result<(HANDLE, HANDLE)> {
         ) == 0
         {
             DeleteProcThreadAttributeList(attr_list);
-            bail!(
-                "UpdateProcThreadAttribute failed: error {}",
-                GetLastError()
-            );
+            bail!("UpdateProcThreadAttribute failed: error {}", GetLastError());
         }
 
         let mut si: STARTUPINFOEXW = std::mem::zeroed();
@@ -623,15 +620,17 @@ impl Proxy {
         let (tx, rx) = mpsc::channel::<Event>();
 
         // Thread: read ConPTY output
-        let pty_out = self.pty_output;
+        // Cast handle to usize to safely send across thread boundary
+        let pty_out_raw = self.pty_output.0 as usize;
         let tx_pty = tx.clone();
         thread::spawn(move || {
+            let handle = pty_out_raw as HANDLE;
             let mut buf = [0u8; 65536];
             loop {
                 let mut bytes_read: DWORD = 0;
                 let ok = unsafe {
                     ReadFile(
-                        pty_out.0,
+                        handle,
                         buf.as_mut_ptr(),
                         buf.len() as DWORD,
                         &mut bytes_read,
@@ -943,19 +942,13 @@ impl Proxy {
                     CSI::Keyboard(Keyboard::PushKittyState { flags, .. }) => {
                         if supported {
                             *stack = stack.saturating_add(1);
-                            debug!(
-                                "Kitty push (flags={:?}, stack={})",
-                                flags, stack
-                            );
+                            debug!("Kitty push (flags={:?}, stack={})", flags, stack);
                         }
                     }
                     CSI::Keyboard(Keyboard::SetKittyState { flags, .. }) => {
                         if supported && !flags.is_empty() && *stack == 0 {
                             *stack = 1;
-                            debug!(
-                                "Kitty set (flags={:?}, stack={})",
-                                flags, stack
-                            );
+                            debug!("Kitty set (flags={:?}, stack={})", flags, stack);
                         }
                     }
                     CSI::Keyboard(Keyboard::PopKittyState(n)) => {
@@ -1381,9 +1374,7 @@ impl Proxy {
             );
             self.last_cols = cols;
             self.last_rows = rows;
-            self.vt_parser
-                .screen_mut()
-                .set_size(rows, cols);
+            self.vt_parser.screen_mut().set_size(rows, cols);
             self.vt_prev_screen = None;
             let size = COORD {
                 X: cols as i16,
