@@ -27,8 +27,29 @@ claude-chill sits between your terminal and Claude Code:
 
 ## Installation
 
+### Windows (pre-built binary)
+
+1. Download `claude-chill-windows-x86_64.zip` from the [latest release](https://github.com/Samjo9999/claude-chill/releases/latest)
+2. Extract `claude-chill.exe` to a folder in your PATH (e.g., `C:\Users\<you>\bin`)
+3. Run: `claude-chill claude`
+
+### Linux / macOS (pre-built binary)
+
+Download the appropriate archive from the [latest release](https://github.com/Samjo9999/claude-chill/releases/latest):
+- Linux: `claude-chill-linux-x86_64.tar.gz`
+- macOS: `claude-chill-macos-x86_64.tar.gz`
+
 ```bash
-cargo install --git https://github.com/davidbeesley/claude-chill
+# Example for Linux:
+tar xzf claude-chill-linux-x86_64.tar.gz
+chmod +x claude-chill
+sudo mv claude-chill /usr/local/bin/
+```
+
+### From source (all platforms)
+
+```bash
+cargo install --git https://github.com/Samjo9999/claude-chill
 ```
 
 Or, if you've cloned the repository locally:
@@ -115,6 +136,7 @@ After `auto_lookback_timeout_ms` (default 15 seconds) of idle (no user input), t
 Config file location:
 - **Linux**: `~/.config/claude-chill.toml`
 - **macOS**: `~/Library/Application Support/claude-chill.toml`
+- **Windows**: `%APPDATA%\claude-chill.toml`
 
 ```toml
 history_lines = 100000           # Max lines stored for lookback
@@ -164,7 +186,7 @@ claude-chill creates a pseudo-terminal (PTY) and spawns Claude Code as a child p
 3. **VT emulation**: Feeds output through a VT100 emulator to track the virtual screen state
 4. **Differential rendering**: Compares current screen to previous and emits only the changes
 5. **History tracking**: Maintains a buffer of output for lookback mode since the last full redraw
-6. **Signal forwarding**: Window resize (SIGWINCH), interrupt (SIGINT), and terminate (SIGTERM) signals are forwarded to Claude
+6. **Signal forwarding**: Window resize (SIGWINCH), interrupt (SIGINT), and terminate (SIGTERM) signals are forwarded to Claude (on Windows: ConPTY handles resize, Ctrl+C passes through as raw byte)
 
 ## Installation with Nix
 
@@ -192,7 +214,7 @@ inputs.claude-chill.packages.${system}.default
 
 ## Disclaimer
 
-This tool was developed for personal convenience. It works for me on Linux and macOS, but it hasn't been extensively tested across different terminals or edge cases. Don't use it to send anyone to space, perform surgery, or run critical infrastructure. If it breaks, you get to keep both pieces.
+This tool was developed for personal convenience. It works on Linux, macOS, and Windows, but it hasn't been extensively tested across different terminals or edge cases. Don't use it to send anyone to space, perform surgery, or run critical infrastructure. If it breaks, you get to keep both pieces.
 
 ## Contributing
 
